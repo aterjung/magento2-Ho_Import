@@ -18,6 +18,7 @@ use Magento\CatalogImportExport\Model\Import\Product\StatusProcessor;
 use Magento\CatalogImportExport\Model\Import\Product\StockProcessor;
 use Magento\CatalogImportExport\Model\StockItemImporterInterface;
 use Magento\Framework\App\ObjectManager;
+use Magento\Framework\Exception\NoSuchEntityException;
 use Magento\Framework\Intl\DateTimeFactory;
 use Magento\Framework\Model\ResourceModel\Db\ObjectRelationProcessor;
 use Magento\Framework\Model\ResourceModel\Db\TransactionManagerInterface;
@@ -39,6 +40,13 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
 
     /** @var string $productEntityLinkField */
     private $productEntityLinkField;
+
+
+    /**
+     * @var ProductRepositoryInterface
+     */
+    private $productRepository;
+
 
     /**
      * @param \Magento\Framework\Json\Helper\Data                                          $jsonHelper
@@ -191,6 +199,9 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
 
         $this->lineFormatterMulti = $lineFormatterMulti;
         $this->catalogConfig = $catalogConfig ?: ObjectManager::getInstance()->get(CatalogConfig::class);
+        $this->productRepository = $productRepository ?? ObjectManager::getInstance()
+                ->get(ProductRepositoryInterface::class);
+
     }
 
     /**
@@ -259,6 +270,7 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
                 }
                 $rowScope = $this->getRowScope($rowData);
                 $rowSku = $rowData[self::COL_SKU];
+                $rowSkuNormalized = mb_strtolower($rowSku);
 
                 if (null === $rowSku) {
                     $this->getErrorAggregator()->addRowToSkip($rowNum);
@@ -271,7 +283,7 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
                 }
 
                 // 1. Entity phase
-                if (isset($this->_oldSku[$rowSku])) {
+                if ($this->isSkuExist($rowSku)) {
                     // existing row
                     if (isset($rowData['attribute_set_code'])) {
                         $attributeSetId = $this->catalogConfig->getAttributeSetId(
@@ -295,7 +307,7 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
                     $entityRowsUp[] = [
                         'updated_at' => (new \DateTime())->format(DateTime::DATETIME_PHP_FORMAT),
                         'attribute_set_id' => $attributeSetId,
-                        $this->getProductEntityLinkField() => $this->_oldSku[$rowSku][$this->getProductEntityLinkField()],
+                        $this->getProductEntityLinkField() =>  $this->getExistingSku($rowSku)[$this->getProductEntityLinkField()],
                     ];
                 } else {
                     if (!$productLimit || $productsQty < $productLimit) {
@@ -325,6 +337,14 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
                     foreach ($websiteCodes as $websiteCode) {
                         $websiteId = $this->storeResolver->getWebsiteCodeToId($websiteCode);
                         $this->websitesCache[$rowSku][$websiteId] = true;
+                    }
+                } else {
+                    $product = $this->retrieveProductBySku($rowSku);
+                    if ($product) {
+                        $websiteIds = $product->getWebsiteIds();
+                        foreach ($websiteIds as $websiteId) {
+                            $this->websitesCache[$rowSku][$websiteId] = true;
+                        }
                     }
                 }
 
@@ -589,58 +609,66 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
             return !$this->getErrorAggregator()->isRowInvalid($rowNum);
         }
         $this->_validatedRows[$rowNum] = true;
+
         $rowScope = $this->getRowScope($rowData);
-        // BEHAVIOR_DELETE use specific validation logic
+        $sku = $rowData[self::COL_SKU];
+
+        // BEHAVIOR_DELETE and BEHAVIOR_REPLACE use specific validation logic
+        if (Import::BEHAVIOR_REPLACE == $this->getBehavior()) {
+            if (self::SCOPE_DEFAULT == $rowScope && !$this->isSkuExist($sku)) {
+                $this->skipRow($rowNum, ValidatorInterface::ERROR_SKU_NOT_FOUND_FOR_DELETE);
+                return false;
+            }
+        }
         if (Import::BEHAVIOR_DELETE == $this->getBehavior()) {
-            if (self::SCOPE_DEFAULT == $rowScope && !isset($this->_oldSku[$rowData[self::COL_SKU]])) {
-                $this->addRowError(ValidatorInterface::ERROR_SKU_NOT_FOUND_FOR_DELETE, $rowNum);
+            if (self::SCOPE_DEFAULT == $rowScope && !$this->isSkuExist($sku)) {
+                $this->skipRow($rowNum, ValidatorInterface::ERROR_SKU_NOT_FOUND_FOR_DELETE);
                 return false;
             }
             return true;
         }
+
+        // if product doesn't exist, need to throw critical error else all errors should be not critical.
+        $errorLevel = $this->getValidationErrorLevel($sku);
+
         if (!$this->validator->isValid($rowData)) {
             foreach ($this->validator->getMessages() as $message) {
-                $this->addRowError($message, $rowNum, $this->validator->getInvalidAttribute());
+                $this->skipRow($rowNum, $message, $errorLevel, $this->validator->getInvalidAttribute());
             }
         }
-        $sku = $rowData[self::COL_SKU];
+
         if (null === $sku) {
-            $this->addRowError(ValidatorInterface::ERROR_SKU_IS_EMPTY, $rowNum);
+            $this->skipRow($rowNum, ValidatorInterface::ERROR_SKU_IS_EMPTY, $errorLevel);
         } elseif (false === $sku) {
-            $this->addRowError(ValidatorInterface::ERROR_ROW_IS_ORPHAN, $rowNum);
+            $this->skipRow($rowNum, ValidatorInterface::ERROR_ROW_IS_ORPHAN, $errorLevel);
         } elseif (self::SCOPE_STORE == $rowScope
             && !$this->storeResolver->getStoreCodeToId($rowData[self::COL_STORE])
         ) {
-            $this->addRowError(ValidatorInterface::ERROR_INVALID_STORE, $rowNum);
+            $this->skipRow($rowNum, ValidatorInterface::ERROR_INVALID_STORE, $errorLevel);
         }
+
         // SKU is specified, row is SCOPE_DEFAULT, new product block begins
         $this->_processedEntitiesCount++;
-        $sku = $rowData[self::COL_SKU];
-        if (isset($this->_oldSku[$sku])) {
+
+        if ($this->isSkuExist($sku) && Import::BEHAVIOR_REPLACE !== $this->getBehavior()) {
             // can we get all necessary data from existent DB product?
             // check for supported type of existing product
-            if (isset($this->_productTypeModels[$this->_oldSku[$sku]['type_id']])) {
+            if (isset($this->_productTypeModels[$this->getExistingSku($sku)['type_id']])) {
                 $this->skuProcessor->addNewSku(
                     $sku,
                     $this->prepareNewSkuData($sku)
                 );
             } else {
-                $this->addRowError(ValidatorInterface::ERROR_TYPE_UNSUPPORTED, $rowNum);
-                // child rows of legacy products with unsupported types are orphans
-                $sku = false;
+                $this->skipRow($rowNum, ValidatorInterface::ERROR_TYPE_UNSUPPORTED, $errorLevel);
             }
         } else {
             // validate new product type and attribute set
-            if (!isset($rowData[self::COL_TYPE]) || !isset($this->_productTypeModels[$rowData[self::COL_TYPE]])) {
-                $this->addRowError(ValidatorInterface::ERROR_INVALID_TYPE, $rowNum);
-            } elseif (!isset(
-                    $rowData[self::COL_ATTR_SET]
-                ) || !isset(
-                    $this->_attrSetNameToId[$rowData[self::COL_ATTR_SET]]
-                )
+            if (!isset($rowData[self::COL_TYPE], $this->_productTypeModels[$rowData[self::COL_TYPE]])) {
+                $this->skipRow($rowNum, ValidatorInterface::ERROR_INVALID_TYPE, $errorLevel);
+            } elseif (!isset($rowData[self::COL_ATTR_SET], $this->_attrSetNameToId[$rowData[self::COL_ATTR_SET]])
             ) {
-                $this->addRowError(ValidatorInterface::ERROR_INVALID_ATTR_SET, $rowNum);
-            } elseif (is_null($this->skuProcessor->getNewSku($sku))) {
+                $this->skipRow($rowNum, ValidatorInterface::ERROR_INVALID_ATTR_SET, $errorLevel);
+            } elseif ($this->skuProcessor->getNewSku($sku) === null) {
                 $this->skuProcessor->addNewSku(
                     $sku,
                     [
@@ -696,6 +724,61 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
     }
 
     /**
+     * Check if product exists for specified SKU
+     *
+     * @param string $sku
+     * @return bool
+     */
+    private function isSkuExist($sku)
+    {
+        $sku = strtolower($sku);
+        return isset($this->_oldSku[$sku]);
+    }
+
+    /**
+     * Get existing product data for specified SKU
+     *
+     * @param string $sku
+     * @return array
+     */
+    private function getExistingSku($sku)
+    {
+        return $this->_oldSku[strtolower($sku)];
+    }
+
+
+    /**
+     * Returns errorLevel for validation
+     *
+     * @param string $sku
+     * @return string
+     */
+    private function getValidationErrorLevel($sku): string
+    {
+        return (!$this->isSkuExist($sku) && Import::BEHAVIOR_REPLACE !== $this->getBehavior())
+            ? ProcessingError::ERROR_LEVEL_CRITICAL
+            : ProcessingError::ERROR_LEVEL_NOT_CRITICAL;
+    }
+
+
+    /**
+     * Retrieve product by sku.
+     *
+     * @param string $sku
+     * @return \Magento\Catalog\Api\Data\ProductInterface|null
+     */
+    private function retrieveProductBySku($sku)
+    {
+        try {
+            $product = $this->productRepository->get($sku);
+        } catch (NoSuchEntityException $e) {
+            return null;
+        }
+        return $product;
+    }
+
+
+        /**
      * @param array $rowData
      * @return bool
      */
@@ -717,10 +800,12 @@ class Product extends \Magento\CatalogImportExport\Model\Import\Product
     private function prepareNewSkuData($sku)
     {
         $data = [];
-        foreach ($this->_oldSku[$sku] as $key => $value) {
+        foreach ($this->getExistingSku($sku) as $key => $value) {
             $data[$key] = $value;
         }
-        $data['attr_set_code'] = $this->_attrSetIdToName[$this->_oldSku[$sku]['attr_set_id']];
+
+        $data['attr_set_code'] = $this->_attrSetIdToName[$this->getExistingSku($sku)['attr_set_id']];
+
         return $data;
     }
 }
